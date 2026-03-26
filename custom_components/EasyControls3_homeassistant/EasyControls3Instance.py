@@ -67,13 +67,26 @@ class EasyControls3Instance:
                 self._sthModified = False
             except Exception as exception:
                 LOGGER.error(f"error in reading ({exception})")
-                if datetime.datetime.now() - self._lastUpdate > self._offlineAfter:
+                if (
+                    self._lastUpdate is not None
+                    and datetime.datetime.now() - self._lastUpdate > self._offlineAfter
+                ):
                     self._isAvailable = False
 
     def _parseData(self, data):
+        MIN_RESPONSE_LEN = 500
+        if len(data) < MIN_RESPONSE_LEN:
+            raise ValueError(
+                f"Response too short: got {len(data)} bytes, expected at least {MIN_RESPONSE_LEN}"
+            )
+
         # device info
-        self._deviceModel = deviceInfo["device_model_data"][data[17 * 2 + 1]]
-        self._deviceType = deviceInfo["device_type_data"][data[16 * 2 + 1]]
+        model_idx = data[17 * 2 + 1]
+        type_idx = data[16 * 2 + 1]
+        model_list = deviceInfo["device_model_data"]
+        type_list = deviceInfo["device_type_data"]
+        self._deviceModel = model_list[model_idx] if model_idx < len(model_list) else f"unknown({model_idx})"
+        self._deviceType = type_list[type_idx] if type_idx < len(type_list) else f"unknown({type_idx})"
         self._SerialNR = (
             data[14 * 2] * 16777216
             + data[14 * 2 + 1] * 65536
@@ -126,8 +139,8 @@ class EasyControls3Instance:
             days=+int(self._filterInterval)
         )
 
-        # duration
-        intensivDurationInMinutes = data[493]
+        # duration (2-byte value, little-endian, at byte offset 493)
+        intensivDurationInMinutes = data[493] | (data[494] << 8)
         intensivDurationHours = math.floor(intensivDurationInMinutes / 60)
         intensivDurationMinutes = intensivDurationInMinutes - 60 * intensivDurationHours
 
@@ -143,34 +156,37 @@ class EasyControls3Instance:
         self._CO2Value = int(data[182]) << 8 | int(data[183])
 
     async def switchMode(self, wantedKWLState):
-        if wantedKWLState is KWLState.AtHome:
-            requestData = "0800f9000112000004120000051200000b37"
-        elif wantedKWLState is KWLState.Away:
-            requestData = "0800f9000112010004120000051200000c37"
-        elif wantedKWLState is KWLState.Intensive:
-            requestedDuration = (
-                self.IntensivDuration.hour * 60 + self.IntensivDuration.minute
-            )
-            requestData = (
-                "0600f9000412"
-                + (requestedDuration).to_bytes(2, byteorder="little").hex()
-                + "05120000"
-                + (requestedDuration + 0x2508).to_bytes(2, byteorder="little").hex()
-            )
-        elif wantedKWLState is KWLState.Individual:
-            requestData = "0600f90004120000051296009e25"
-        else:
-            raise TypeError("direction must be an instance of Direction Enum")
+        try:
+            if wantedKWLState is KWLState.AtHome:
+                requestData = "0800f9000112000004120000051200000b37"
+            elif wantedKWLState is KWLState.Away:
+                requestData = "0800f9000112010004120000051200000c37"
+            elif wantedKWLState is KWLState.Intensive:
+                requestedDuration = (
+                    self.IntensivDuration.hour * 60 + self.IntensivDuration.minute
+                )
+                requestData = (
+                    "0600f9000412"
+                    + (requestedDuration).to_bytes(2, byteorder="little").hex()
+                    + "05120000"
+                    + (requestedDuration + 0x2508).to_bytes(2, byteorder="little").hex()
+                )
+            elif wantedKWLState is KWLState.Individual:
+                requestData = "0600f90004120000051296009e25"
+            else:
+                raise TypeError("direction must be an instance of Direction Enum")
 
-        request = bytes.fromhex(requestData)
-        response = await self._exchangeData(request)
+            request = bytes.fromhex(requestData)
+            response = await self._exchangeData(request)
 
-        if bytes.fromhex("0200f500f700") == response:
-            LOGGER.debug("expected response")
-        else:
-            LOGGER.debug("unexpected response")
+            if bytes.fromhex("0200f500f700") == response:
+                LOGGER.debug("expected response")
+            else:
+                LOGGER.debug("unexpected response")
 
-        self._sthModified = True
+            self._sthModified = True
+        except Exception as exception:
+            LOGGER.error(f"error in switchMode ({exception})")
 
     def checkFanSpeedLimit(self, requestedFanSpeed: int):
         if requestedFanSpeed < 1:
@@ -207,44 +223,47 @@ class EasyControls3Instance:
         )  # needs to be 1byte, 2 nibble long
 
     async def setFanSpeed(self, requestedFanSpeed: int, mode: KWLState):
-        requestedFanSpeed = self.checkFanSpeedLimit(requestedFanSpeed)
-        requestedSpeedPlainString = self.createFanSpeedPlainRequestString(
-            requestedFanSpeed
-        )
-        requestedSpeedModdedString = self.createFanSpeedModdedRequestString(
-            requestedFanSpeed, mode
-        )
+        try:
+            requestedFanSpeed = self.checkFanSpeedLimit(requestedFanSpeed)
+            requestedSpeedPlainString = self.createFanSpeedPlainRequestString(
+                requestedFanSpeed
+            )
+            requestedSpeedModdedString = self.createFanSpeedModdedRequestString(
+                requestedFanSpeed, mode
+            )
 
-        modeIdentifier = "21"  # Intensive
+            modeIdentifier = "21"  # Intensive
 
-        if mode is KWLState.AtHome:
-            modeIdentifier = "1B"
-        elif mode is KWLState.Away:
-            modeIdentifier = "15"
-        elif mode is KWLState.Intensive:
-            modeIdentifier = "21"
-        else:  # Individual/Fireplace should not be changed from here
-            LOGGER.debug("Individual/Fireplace is not supported")
-            return
+            if mode is KWLState.AtHome:
+                modeIdentifier = "1B"
+            elif mode is KWLState.Away:
+                modeIdentifier = "15"
+            elif mode is KWLState.Intensive:
+                modeIdentifier = "21"
+            else:  # Individual/Fireplace should not be changed from here
+                LOGGER.debug("Individual/Fireplace is not supported")
+                return
 
-        requestData = (
-            "04 00 f9 00"
-            + modeIdentifier
-            + "50"
-            + requestedSpeedPlainString
-            + "00"
-            + requestedSpeedModdedString
-            + "51"
-        )
+            requestData = (
+                "04 00 f9 00"
+                + modeIdentifier
+                + "50"
+                + requestedSpeedPlainString
+                + "00"
+                + requestedSpeedModdedString
+                + "51"
+            )
 
-        request = bytes.fromhex(requestData)
-        response = await self._exchangeData(request)
-        if bytes.fromhex("0200f500f700") == response:
-            LOGGER.debug("expected response")
-        else:
-            LOGGER.debug("unexpected response")
+            request = bytes.fromhex(requestData)
+            response = await self._exchangeData(request)
+            if bytes.fromhex("0200f500f700") == response:
+                LOGGER.debug("expected response")
+            else:
+                LOGGER.debug("unexpected response")
 
-        self._sthModified = True
+            self._sthModified = True
+        except Exception as exception:
+            LOGGER.error(f"error in setFanSpeed ({exception})")
 
     async def setIntensiveFanSpeed(self, requestedFanSpeed: int):
         await self.setFanSpeed(requestedFanSpeed, KWLState.Intensive)
@@ -256,32 +275,35 @@ class EasyControls3Instance:
         await self.setFanSpeed(requestedFanSpeed, KWLState.Away)
 
     async def setIntensiveDuration(self, requestedDurationTime: datetime.time):
-        requestedDuration = (
-            requestedDurationTime.hour * 60 + requestedDurationTime.minute
-        )
-        if requestedDuration < 1:
-            requestedDuration = 1
-        elif (
-            requestedDuration > 0x5A0
-        ):  # if the time should be more than 0x5A0 (24*60min = 1 day it doesn't make sense anymore)
-            requestedDuration = 0x5A0
-        else:
-            requestedDuration = round(requestedDuration)
+        try:
+            requestedDuration = (
+                requestedDurationTime.hour * 60 + requestedDurationTime.minute
+            )
+            if requestedDuration < 1:
+                requestedDuration = 1
+            elif (
+                requestedDuration > 0x5A0
+            ):  # if the time should be more than 0x5A0 (24*60min = 1 day it doesn't make sense anymore)
+                requestedDuration = 0x5A0
+            else:
+                requestedDuration = round(requestedDuration)
 
-        requestData = (
-            "0400f9004050"
-            + (requestedDuration).to_bytes(2, byteorder="little").hex()
-            + (requestedDuration + 0x513D).to_bytes(2, byteorder="little").hex()
-        )
+            requestData = (
+                "0400f9004050"
+                + (requestedDuration).to_bytes(2, byteorder="little").hex()
+                + (requestedDuration + 0x513D).to_bytes(2, byteorder="little").hex()
+            )
 
-        request = bytes.fromhex(requestData)
-        response = await self._exchangeData(request)
-        if bytes.fromhex("0200f500f700") == response:
-            LOGGER.debug("expected response")
-        else:
-            LOGGER.debug("unexpected response")
+            request = bytes.fromhex(requestData)
+            response = await self._exchangeData(request)
+            if bytes.fromhex("0200f500f700") == response:
+                LOGGER.debug("expected response")
+            else:
+                LOGGER.debug("unexpected response")
 
-        self._sthModified = True
+            self._sthModified = True
+        except Exception as exception:
+            LOGGER.error(f"error in setIntensiveDuration ({exception})")
 
     async def test_connection(self) -> bool:
         # """Test connectivity by doing a read."""
@@ -291,19 +313,22 @@ class EasyControls3Instance:
         return bool(response is not None)
 
     async def turnOffOn(self, requestTurnOff: bool):
-        if requestTurnOff is True:
-            requestData = "0400f900021205000413"
-        else:
-            requestData = "0400f90002120000ff12"
+        try:
+            if requestTurnOff is True:
+                requestData = "0400f900021205000413"
+            else:
+                requestData = "0400f90002120000ff12"
 
-        request = bytes.fromhex(requestData)
-        response = await self._exchangeData(request)
-        if bytes.fromhex("0200f500f700") == response:
-            LOGGER.debug("expected response")
-        else:
-            LOGGER.debug("unexpected response")
+            request = bytes.fromhex(requestData)
+            response = await self._exchangeData(request)
+            if bytes.fromhex("0200f500f700") == response:
+                LOGGER.debug("expected response")
+            else:
+                LOGGER.debug("unexpected response")
 
-        self._sthModified = True
+            self._sthModified = True
+        except Exception as exception:
+            LOGGER.error(f"error in turnOffOn ({exception})")
 
     @property
     def url(self):

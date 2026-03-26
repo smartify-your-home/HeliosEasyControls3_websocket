@@ -29,11 +29,9 @@ class KWLOnOffSwitch(SwitchEntity):
 
     async def async_turn_on(self, **kwargs):
         await self._easyConnector.turnOffOn(requestTurnOff=False)
-        self.IsOn = False
 
     async def async_turn_off(self, **kwargs):
         await self._easyConnector.turnOffOn(requestTurnOff=True)
-        self.IsOn = True
 
     @property
     def device_info(self):
