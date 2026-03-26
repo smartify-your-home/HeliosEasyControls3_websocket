@@ -32,7 +32,11 @@ async def validate_input(hass: HomeAssistant, data: dict) -> dict[str, Any]:
         raise InvalidHost
 
     easyControlsInstance = EasyControls3Instance(data["host"])
-    result = await easyControlsInstance.test_connection()
+    try:
+        result = await easyControlsInstance.test_connection()
+    except Exception:
+        raise CannotConnect
+
     if not result:
         raise CannotConnect
 
